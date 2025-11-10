@@ -100,3 +100,21 @@ This route treats the HBS decomposition as a structured layer within a deep lear
 
 ### Regularizes/Losses:
 Penalize energy outside the compressed subspace, or add nuclear norm penalty on residuals so few low-rank corrections suffice. Optionally combine with randomized sketch losses (ensure action on random probes is preserved).
+
+
+
+**Pros**
+
+1. Large reduction of storage if 𝐵 is near-linear and k≪n.
+
+2. Multiplication becomes fast (log-linear) for many matrices that are compressible in butterfly bases.
+
+3. Flexible: errors can be fixed locally via low-rank residuals (so accuracy tunable).
+
+**Cons / risks**
+
+1. Not every dense matrix is well-approximated by butterfly+small core; worst-case may need large 𝑘 or many low-rank terms.
+
+2. Choosing good butterfly patterns and sketching dimensions 𝑘 is nontrivial — may need data-driven tuning.
+
+3. Implementation complexity: need efficient butterfly kernels and careful numerical stability (orthonormalization etc).
