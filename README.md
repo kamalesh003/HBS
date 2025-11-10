@@ -1,9 +1,5 @@
 # HBS
-That's a very concise and well-structured proposal for a **Hierarchical Butterfly–Sketch (HBS) Representation**! It clearly outlines the motivation, the concrete mathematical form, and the role of each component.
 
-Here is the proposal exactly as requested, ready for you to copy:
-
----
 
 ## Hierarchical Butterfly–Sketch (HBS) Representation
 
@@ -11,8 +7,10 @@ Here is the proposal exactly as requested, ready for you to copy:
 
 **Concretely propose:**
 
-$$M \approx B_L \, S \, B_R + \sum_{i=1}^{p} U_i V_i^\top \tag{HBS}$$
-
+[
+M \approx B_L , S , B_R + \sum_{i=1}^{p} U_i V_i^\top
+\tag{HBS}
+]
 where:
 
 * $B_L, B_R$ are **butterfly-structured matrices** (log-depth, near-linear nonzeros). They act like fast orthogonal-ish transforms (think FWT/FJLT/butterfly nets). (fast multiply in $O(n \log n)$).
