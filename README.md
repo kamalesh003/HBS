@@ -57,3 +57,41 @@ Given vector $x \in \mathbb{R}^n$:
 **Total cost** $\approx O(n \log n + k^2 + p\,nr)$. Choose $k, p, r$ to balance accuracy vs cost.
 
 *(If **k** grows like **log n** and **pr** is small, we get near **O(n log n)** complexity.)*
+
+
+
+
+
+This is a concise and complete description of the two main strategies for training and fitting the **Hierarchical Butterfly–Sketch (HBS) Representation**.
+
+Here is the requested text, ready for you to copy:
+
+---
+
+## 🛠️ How to Learn / Fit (Training / Fitting Procedure)
+
+The HBS factors can be learned using two primary routes, depending on whether the goal is an optimal linear approximation of a fixed matrix $M$ or integration into a larger learning model.
+
+### A. Direct Factor Fitting (Linear / Least-Squares)
+
+The objective is to minimize the Frobenius norm of the residual error:
+$$\|M - (B_L S B_R + \sum U_i V_i^\top)\|_F$$
+
+This is typically solved via **alternating optimization**:
+
+1.  **Initialize/Fix Butterfly Patterns** (sparsity pattern and signs) and **learn their nonzero entries** + $S$ and $\{U_i, V_i\}$.
+2.  **Iterative Steps:**
+    * **(i) Fix $B$ and $U, V$:** Solve for $S$ (a **small dense Least-Squares** problem).
+    * **(ii) Fix $B$ and $S$:** Solve for the low-rank residuals $\sum U_i V_i^\top$ (e.g., via **SVD** or rank-constrained optimization on the residual $M - B_L S B_R$).
+    * **(iii) Fix $S$ and $U, V$:** Update $B_L, B_R$ factors via **constrained LS or gradient steps** while maintaining the butterfly structure.
+
+---
+
+### B. Integration in Neural Nets (End-to-End / QAT-like)
+
+This route treats the HBS decomposition as a structured layer within a deep learning framework.
+
+1.  **Replace a dense linear layer** with the HBS module (implement fast butterfly layers as parameterized sparse layers).
+2.  During training, perform a **forward pass using HBS** and **backpropagate through all parts** (butterfly parameters, $S$, low-rank parameters).
+3.  Use **straight-through estimators or soft-rounding** if you later need PoT (power-of-two) or integer-friendly operations (Quantization-Aware Training (QAT)-like).
+4.  Because transforms are structured, **training remains scalable**. Butterfly layers have been trained successfully in prior work.
