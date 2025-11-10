@@ -68,3 +68,12 @@ The **"Integration in Neural Nets (End-to-End)"** procedure from the R\&D docume
     $$\mathcal{L} = -\left[\log p_Z(z) + \sum_{i=1}^K \log|\det(M_{\text{Flow}, i})|\right]$$
 4.  **Optimization:** Use gradient descent (e.g., Adam) to **backpropagate through all parts**: the butterfly factors' sparse weights, the small dense core $S$, and any non-linear layer parameters. "Because transforms are structured, **training remains scalable**".
 5.  **Regularization:** Optionally, regularize the factors of $B_L$ and $B_R$ towards orthogonality to improve flow stability and invertibility over deep stacks.
+
+
+
+
+
+
+
+<img width="678" height="521" alt="Screenshot 2025-11-10 175153" src="https://github.com/user-attachments/assets/255214d2-2ecd-42a3-9d5d-f5bd8a65edfc" />
+
