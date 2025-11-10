@@ -8,11 +8,12 @@
 **Concretely propose:**
 
 
-$$M \approx B_L \, S \, B_R + \sum_{i=1}^{p} U_i V_i^\top \tag{HBS}$$
+<img width="248" height="85" alt="Screenshot 2025-11-10 165510" src="https://github.com/user-attachments/assets/57cc4c0b-339a-4d9b-90ce-199025a54ec6" />
+
 
 where:
 
-* $B_L, B_R$ are **butterfly-structured matrices** (log-depth, near-linear nonzeros). They act like fast orthogonal-ish transforms (think FWT/FJLT/butterfly nets). (fast multiply in $O(n \log n)$).
+* $B_L, B_R$ are **butterfly-structured matrices** (log-depth, near-linear nonzeros). They act like fast orthogonal-ish transforms (think FWT/FJLT/butterfly nets). (fast multiply in O(n log n).
 * $S \in \mathbb{R}^{k \times k}$ is a **very small dense core** (with $k \ll n$) that captures the main coupling after projection into the butterfly domain. We obtain $S$ by sketching/projecting rows/cols into $k$-dim subspaces (JL/TensorSketch style).
 * $\sum_{i=1}^p U_i V_i^\top$ is a **sum of local low-rank corrections** (blockwise low-rank / hierarchical matrix idea) that fixes near-field interactions that the coarse factor misses. Each $U_i, V_i$ has small column dimension $r$. This is the hierarchical / H-matrix element.
 
