@@ -95,3 +95,8 @@ This route treats the HBS decomposition as a structured layer within a deep lear
 2.  During training, perform a **forward pass using HBS** and **backpropagate through all parts** (butterfly parameters, $S$, low-rank parameters).
 3.  Use **straight-through estimators or soft-rounding** if you later need PoT (power-of-two) or integer-friendly operations (Quantization-Aware Training (QAT)-like).
 4.  Because transforms are structured, **training remains scalable**. Butterfly layers have been trained successfully in prior work.
+
+
+
+### Regularizes/Losses:
+Penalize energy outside the compressed subspace, or add nuclear norm penalty on residuals so few low-rank corrections suffice. Optionally combine with randomized sketch losses (ensure action on random probes is preserved).
