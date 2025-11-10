@@ -56,4 +56,4 @@ Given vector $x \in \mathbb{R}^n$:
 
 **Total cost** $\approx O(n \log n + k^2 + p\,nr)$. Choose $k, p, r$ to balance accuracy vs cost.
 
-*(If $k$ grows like $\log n$ and $pr$ is small, we get near $O(n \log n)$ complexity.)*
+*(If **k** grows like **log n** and **pr** is small, we get near **O(n log n)** complexity.)*
