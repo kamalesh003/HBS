@@ -8,8 +8,7 @@
 **Concretely propose:**
 
 
-M \approx B_L , S , B_R + \sum_{i=1}^{p} U_i V_i^\top
-\tag{HBS}
+$$M \approx B_L \, S \, B_R + \sum_{i=1}^{p} U_i V_i^\top \tag{HBS}$$
 
 where:
 
