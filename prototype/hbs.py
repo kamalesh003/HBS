@@ -321,7 +321,7 @@ class StabilizedButterflyLayer(nn.Module):
         n_stages: int = None,
         init_scale: float = 0.02,
         stabilize: bool = True,
-        block_scale_size: int = 16,
+        block_scale_size: int = 16,  # Keep parameter for compatibility but don't use
         init_mode: Literal["random", "identity", "hadamard", "hadamard_exact"] = "random",
         require_pow2: bool = False,
         checkpoint_activations: bool = False,
@@ -361,34 +361,35 @@ class StabilizedButterflyLayer(nn.Module):
             raise ValueError(f"Unknown init_mode {init_mode}")
         self.stage_angles = nn.Parameter(ang)
 
-        # Stabilization components
+        # Stabilization components - ONLY LayerNorm, NO block scales
         self.stabilize = stabilize
         self.checkpoint_activations = checkpoint_activations
         # per-stage LayerNorm (applied to the full vector after each stage)
-        self.stage_layernorms = nn.ModuleList([nn.LayerNorm(n, eps=1e-5) for _ in range(self.n_stages)])
-        # blockwise reconditioning scales (learnable multiplicative factors per small block)
-        self.block_scale_size = block_scale_size
-        n_blocks = max(1, n // block_scale_size)
-        self.stage_block_scales = nn.ParameterList([
-            nn.Parameter(torch.ones(n_blocks) * 1.0) for _ in range(self.n_stages)
-        ])
+        if self.stabilize:
+            self.stage_layernorms = nn.ModuleList([nn.LayerNorm(n, eps=1e-5) for _ in range(self.n_stages)])
+        else:
+            self.stage_layernorms = None
 
     def _stage_forward(self, cur: torch.Tensor, s: int) -> torch.Tensor:
         """One stage forward: cur -> next (used for checkpointing)."""
         angles_s = self.stage_angles[s].contiguous().to(cur.device)
         temp = torch.empty_like(cur)
         _run_butterfly_stage(cur, angles_s, temp)
-        normed = self.stage_layernorms[s](temp)
-        scales = self.stage_block_scales[s]
-        expanded = scales.repeat_interleave(self.block_scale_size)
-        expanded = expanded.to(normed.device)
-        if expanded.numel() < self.n:
-            pad = self.n - expanded.numel()
-            expanded = torch.cat([expanded, torch.ones(pad, device=expanded.device)])
-        elif expanded.numel() > self.n:
-            expanded = expanded[:self.n]
-        scaled = normed * expanded.unsqueeze(0)
-        return scaled
+        
+        if self.stabilize:
+            # Only apply LayerNorm for stabilization
+            normed = self.stage_layernorms[s](temp)
+            return normed
+        else:
+            # Pure orthogonal transform
+            return temp
+
+    def project_angles_to_rotation(self):
+        """Project angles to maintain strict rotation matrix properties."""
+        with torch.no_grad():
+            # Ensure angles stay within reasonable numerical range
+            # This prevents drift while maintaining differentiability during forward pass
+            self.stage_angles.data = self.stage_angles.data % (2 * math.pi)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, n = x.shape
@@ -414,10 +415,14 @@ class StabilizedButterflyLayer(nn.Module):
             return activations[-1].clone()
 
     def enforce_orthonormal(self):
-        """Clamp block scales; angles are orthonormal by construction."""
+        """Enforce strict orthonormality - project angles and ensure numerical stability."""
         with torch.no_grad():
-            for s in self.stage_block_scales:
-                s.clamp_(0.1, 10.0)
+            # Project angles to prevent numerical drift
+            self.project_angles_to_rotation()
+            
+            # Optional: Add small regularization to prevent extreme angles
+            # that might cause numerical issues
+            self.stage_angles.data = torch.clamp(self.stage_angles.data, -2*math.pi, 2*math.pi)
 
     def project_to_orthonormal(self):
         # placeholder for future non-angle params
@@ -574,11 +579,11 @@ class HBSLinear(nn.Module):
 
         # stabilized butterflies: pass init_mode, pow2, checkpoint flag
         self.BR = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
-                                          block_scale_size=block_scale_size, init_mode=init_mode,
-                                          require_pow2=require_pow2, checkpoint_activations=checkpoint_activations)
+                                          init_mode=init_mode, require_pow2=require_pow2, 
+                                          checkpoint_activations=checkpoint_activations)
         self.BL = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
-                                          block_scale_size=block_scale_size, init_mode=init_mode,
-                                          require_pow2=require_pow2, checkpoint_activations=checkpoint_activations)
+                                          init_mode=init_mode, require_pow2=require_pow2, 
+                                          checkpoint_activations=checkpoint_activations)
 
         # Sketch selection
         self.sketch_type = sketch_type
