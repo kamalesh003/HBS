@@ -752,7 +752,7 @@ class StabilizedButterflyLayer(nn.Module):
         with torch.no_grad():
             # Ensure angles stay within reasonable numerical range
             # This prevents drift while maintaining differentiability during forward pass
-            self.stage_angles.data = self.stage_angles.data % (2 * math.pi)
+            self.stage_angles.data = ((self.stage_angles.data + math.pi) % (2 * math.pi)) - math.pi
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, n = x.shape
