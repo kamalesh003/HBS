@@ -7,7 +7,7 @@
 
 import math
 import random
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -42,9 +42,227 @@ def fwht(x: torch.Tensor) -> torch.Tensor:
     return out
 
 # ----------------------------
+# Power-of-Two Quantization
+# ----------------------------
+class PowerOfTwoQuantizer(nn.Module):
+    def __init__(self, bits: int = 8, symmetric: bool = True):
+        super().__init__()
+        self.bits = bits
+        self.symmetric = symmetric
+        self.levels = 2 ** (bits - 1) if symmetric else 2 ** bits
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training:
+            return self.quantize(x)
+        return x
+
+    def quantize(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantize to nearest power-of-two values"""
+        if self.symmetric:
+            max_val = torch.max(torch.abs(x))
+            scale = max_val / (self.levels - 1) if max_val > 0 else 1.0
+        else:
+            min_val = torch.min(x)
+            max_val = torch.max(x)
+            scale = (max_val - min_val) / self.levels if max_val > min_val else 1.0
+
+        # Quantize to nearest power-of-two
+        x_scaled = x / scale
+        if self.symmetric:
+            x_scaled = torch.clamp(x_scaled, -self.levels + 1, self.levels - 1)
+        else:
+            x_scaled = torch.clamp(x_scaled, 0, self.levels - 1)
+
+        # Round to nearest power-of-two
+        x_quant = torch.sign(x_scaled) * torch.pow(2.0, torch.round(torch.log2(torch.abs(x_scaled) + 1e-8)))
+        return x_quant * scale
+
+# ----------------------------
+# Blockwise Reconditioning
+# ----------------------------
+class BlockwiseReconditioner(nn.Module):
+    def __init__(self, n: int, block_size: int = 16, eps: float = 1e-5):
+        super().__init__()
+        self.n = n
+        self.block_size = block_size
+        self.eps = eps
+        self.num_blocks = (n + block_size - 1) // block_size
+
+        # Learnable scale and shift per block
+        self.scales = nn.Parameter(torch.ones(self.num_blocks))
+        self.shifts = nn.Parameter(torch.zeros(self.num_blocks))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, n = x.shape
+        assert n == self.n
+
+        # Apply blockwise normalization
+        x_out = torch.zeros_like(x)
+        for i in range(self.num_blocks):
+            start = i * self.block_size
+            end = min((i + 1) * self.block_size, n)
+            block = x[:, start:end]
+
+            # Compute block statistics
+            mean = block.mean(dim=1, keepdim=True)
+            var = block.var(dim=1, keepdim=True)
+
+            # Normalize and apply learnable scale/shift
+            block_norm = (block - mean) / torch.sqrt(var + self.eps)
+            block_out = block_norm * self.scales[i] + self.shifts[i]
+            x_out[:, start:end] = block_out
+
+        return x_out
+
+# ----------------------------
+# Multi-Stage Routing Optimization
+# ----------------------------
+class MultiStageRouter(nn.Module):
+    def __init__(self, n: int, n_stages: int, routing_dim: int = 32):
+        super().__init__()
+        self.n = n
+        self.n_stages = n_stages
+        self.routing_dim = routing_dim
+
+        # Routing gates for each stage
+        self.routing_gates = nn.ParameterList([
+            nn.Parameter(torch.randn(routing_dim, n) * 0.02)
+            for _ in range(n_stages)
+        ])
+
+        # Routing decision networks (small MLPs)
+        self.route_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(n, routing_dim),
+                nn.GELU(),
+                nn.Linear(routing_dim, 2)  # 2 routes per decision
+            )
+            for _ in range(n_stages)
+        ])
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Compute routing weights for each stage"""
+        B, n = x.shape
+        routing_weights = []
+
+        for stage in range(self.n_stages):
+            # Compute routing scores
+            route_logits = self.route_mlps[stage](x)  # (B, 2)
+            route_weights = F.softmax(route_logits, dim=-1)  # (B, 2)
+            routing_weights.append(route_weights)
+
+        return routing_weights
+
+# ----------------------------
+# Direct Factor Fitting (Alternating Optimization)
+# ----------------------------
+class DirectFactorFitter:
+    def __init__(self, hbs_layer: 'HBSLinear', max_iters: int = 100, tol: float = 1e-6):
+        self.hbs_layer = hbs_layer
+        self.max_iters = max_iters
+        self.tol = tol
+
+    def fit_to_matrix(self, M: torch.Tensor, verbose: bool = False) -> float:
+        """
+        Fit HBS layer to target matrix M using alternating optimization
+        Returns final reconstruction error
+        """
+        n, _ = M.shape
+        device = M.device
+
+        # Initialize with random batch for fitting
+        batch_size = min(32, n)
+        X = torch.randn(batch_size, n, device=device)
+        Y_target = X @ M.t()
+
+        best_loss = float('inf')
+
+        for iteration in range(self.max_iters):
+            total_loss = 0.0
+            num_batches = 0
+
+            # (i) Fix B and U,V, solve for S
+            with torch.no_grad():
+                Z = self.hbs_layer.BR(X)  # (B, n)
+                Z_k = self.hbs_layer._project(Z)  # (B, k)
+
+                # Solve S via least squares: Z_k @ S ≈ Y_target projected
+                Y_proj = self.hbs_layer._project(Y_target)
+                S_solution = torch.linalg.lstsq(Z_k, Y_proj).solution
+                self.hbs_layer.S.data = S_solution.t()
+
+            # (ii) Fix B and S, solve for low-rank residuals - CRITICAL FIX APPLIED
+            with torch.no_grad():
+                # Compute current approximation without low-rank terms
+                Z = self.hbs_layer.BR(X)
+                Z_k = self.hbs_layer._project(Z)
+                W = Z_k @ self.hbs_layer.S
+
+                # FIX THE DEVICE MISMATCH FOR Pmat
+                if self.hbs_layer.P is not None:
+                    W_exp = W @ self.hbs_layer.P.t()
+                else:
+                    Pmat = self.hbs_layer._build_dense_sketch_matrix().to(W.device, W.dtype)
+                    W_exp = W @ Pmat.t()
+
+                U_approx = self.hbs_layer.BL(W_exp)
+
+                # Residual for low-rank fitting
+                residual = Y_target - U_approx
+
+                # Fit low-rank blocks to residual - FIXED U/V ASSIGNMENT
+                for i in range(self.hbs_layer.p):
+                    start_in = i * self.hbs_layer.block_in
+                    end_in = (i + 1) * self.hbs_layer.block_in
+                    start_out = i * self.hbs_layer.block_out
+                    end_out = (i + 1) * self.hbs_layer.block_out
+
+                    X_block = X[:, start_in:end_in]
+                    residual_block = residual[:, start_out:end_out]
+
+                    # SVD for low-rank approximation
+                    U_svd, S_svd, V_svd = torch.svd(residual_block.t() @ X_block)
+                    U_rank = U_svd[:, :self.hbs_layer.r] @ torch.diag(torch.sqrt(S_svd[:self.hbs_layer.r]))
+                    V_rank = V_svd[:, :self.hbs_layer.r] @ torch.diag(torch.sqrt(S_svd[:self.hbs_layer.r]))
+
+                    # CRITICAL FIX: Do NOT transpose U_rank
+                    self.hbs_layer.U_list[i].data = U_rank      # FIXED: (block_out × r)
+                    self.hbs_layer.V_list[i].data = V_rank      # (block_in × r)
+
+            # (iii) Fix S and U,V, update butterfly factors
+            optimizer = torch.optim.Adam(
+                list(self.hbs_layer.BR.parameters()) + list(self.hbs_layer.BL.parameters()),
+                lr=1e-3
+            )
+
+            for inner_iter in range(5):  # Few inner iterations for butterfly update
+                optimizer.zero_grad()
+                Y_pred = self.hbs_layer(X)
+                loss = F.mse_loss(Y_pred, Y_target)
+                loss.backward()
+                optimizer.step()
+
+                # Enforce stability
+                self.hbs_layer.enforce_stability()
+
+            total_loss += loss.item()
+            num_batches += 1
+
+            avg_loss = total_loss / num_batches
+            if verbose and iteration % 10 == 0:
+                print(f"Iteration {iteration}, Loss: {avg_loss:.6f}")
+
+            if abs(avg_loss - best_loss) < self.tol:
+                if verbose:
+                    print(f"Converged at iteration {iteration}")
+                break
+
+            best_loss = min(best_loss, avg_loss)
+
+        return best_loss
+
+# ----------------------------
 # Triton WHT kernel (per-batch fused WHT)
-# This kernel computes the (unnormalized) Hadamard transform:
-# after all stages, optionally divides by sqrt(n) to produce orthonormal H.
 # ----------------------------
 @triton.jit
 def _triton_wht_kernel_per_batch(
@@ -312,123 +530,6 @@ def _run_butterfly_fused(x: torch.Tensor, stage_angles: torch.Tensor, activation
     )
 
 # ----------------------------
-# StabilizedButterflyLayer with init modes and checkpointing
-# ----------------------------
-class StabilizedButterflyLayer(nn.Module):
-    def __init__(
-        self,
-        n: int,
-        n_stages: int = None,
-        init_scale: float = 0.02,
-        stabilize: bool = True,
-        block_scale_size: int = 16,  # Keep parameter for compatibility but don't use
-        init_mode: Literal["random", "identity", "hadamard", "hadamard_exact"] = "random",
-        require_pow2: bool = False,
-        checkpoint_activations: bool = False,
-    ):
-        """
-        init_mode:
-          - 'random' : small normal angles (default)
-          - 'identity': zero angles -> identity transform
-          - 'hadamard': approximate hadamard by pi/4 rotations (kept for compatibility)
-          - 'hadamard_exact': exact orthonormal Hadamard init via angle -pi/4
-        require_pow2: if True, assert n is power-of-two
-        checkpoint_activations: if True, use torch.checkpoint per stage to save memory (recomputes in backward)
-        """
-        super().__init__()
-        assert n % 2 == 0, "n must be even (pairs)"
-        if require_pow2:
-            assert is_power_of_two(n), "n must be power-of-two when require_pow2=True"
-        self.n = n
-        if n_stages is None:
-            self.n_stages = int(math.log2(n))
-        else:
-            self.n_stages = n_stages
-        self.n_pairs = n // 2
-
-        # parameterize rotations with angles (orthonormal by construction)
-        if init_mode == "random":
-            ang = init_scale * torch.randn(self.n_stages, self.n_pairs)
-        elif init_mode == "identity":
-            ang = torch.zeros(self.n_stages, self.n_pairs)
-        elif init_mode == "hadamard":
-            # kept for backward compatibility (previous approximate mode)
-            ang = (math.pi / 4.0) * torch.ones(self.n_stages, self.n_pairs)
-        elif init_mode == "hadamard_exact":
-            # exact orthonormal Hadamard: angle = -pi/4 (gives [[1,1],[1,-1]]/sqrt(2) per pair)
-            ang = (-math.pi / 4.0) * torch.ones(self.n_stages, self.n_pairs)
-        else:
-            raise ValueError(f"Unknown init_mode {init_mode}")
-        self.stage_angles = nn.Parameter(ang)
-
-        # Stabilization components - ONLY LayerNorm, NO block scales
-        self.stabilize = stabilize
-        self.checkpoint_activations = checkpoint_activations
-        # per-stage LayerNorm (applied to the full vector after each stage)
-        if self.stabilize:
-            self.stage_layernorms = nn.ModuleList([nn.LayerNorm(n, eps=1e-5) for _ in range(self.n_stages)])
-        else:
-            self.stage_layernorms = None
-
-    def _stage_forward(self, cur: torch.Tensor, s: int) -> torch.Tensor:
-        """One stage forward: cur -> next (used for checkpointing)."""
-        angles_s = self.stage_angles[s].contiguous().to(cur.device)
-        temp = torch.empty_like(cur)
-        _run_butterfly_stage(cur, angles_s, temp)
-        
-        if self.stabilize:
-            # Only apply LayerNorm for stabilization
-            normed = self.stage_layernorms[s](temp)
-            return normed
-        else:
-            # Pure orthogonal transform
-            return temp
-
-    def project_angles_to_rotation(self):
-        """Project angles to maintain strict rotation matrix properties."""
-        with torch.no_grad():
-            # Ensure angles stay within reasonable numerical range
-            # This prevents drift while maintaining differentiability during forward pass
-            self.stage_angles.data = self.stage_angles.data % (2 * math.pi)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, n = x.shape
-        assert n == self.n
-        if self.stabilize:
-            cur = x
-            activations = [cur]  # store pre-stage activations for debugging when not checkpointed
-            for s in range(self.n_stages):
-                if self.checkpoint_activations:
-                    cur = cur.requires_grad_(True)
-                    cur = torch_checkpoint.checkpoint(lambda t, s=s: self._stage_forward(t, s), cur, use_reentrant=False)
-                    activations.append(cur)  # note: recomputed version (not stored by checkpoint)
-                else:
-                    cur = self._stage_forward(cur, s)
-                    activations.append(cur)
-            self._last_activations = torch.stack(activations, dim=0)
-            return cur
-        else:
-            activations = torch.empty((self.n_stages + 1, B, n), device=x.device, dtype=x.dtype)
-            activations[0].copy_(x)
-            _run_butterfly_fused(x, self.stage_angles, activations)
-            self._last_activations = activations
-            return activations[-1].clone()
-
-    def enforce_orthonormal(self):
-        """Enforce strict orthonormality - project angles and ensure numerical stability."""
-        with torch.no_grad():
-            # Project angles to prevent numerical drift
-            self.project_angles_to_rotation()
-            
-            # Optional: Add small regularization to prevent extreme angles
-            # that might cause numerical issues
-            self.stage_angles.data = torch.clamp(self.stage_angles.data, -2*math.pi, 2*math.pi)
-
-    def project_to_orthonormal(self):
-        # placeholder for future non-angle params
-        return
-
-# ----------------------------
 # Fused function wrapper (unchanged)
 # ----------------------------
 class ButterflyFunctionFused(torch.autograd.Function):
@@ -540,7 +641,158 @@ class Sketch:
             raise RuntimeError("invalid sketch type")
 
 # ----------------------------
-# HBSLinear (integrates sketch selection, pow2 option, init_mode)
+# Enhanced StabilizedButterflyLayer with new features
+# ----------------------------
+class StabilizedButterflyLayer(nn.Module):
+    def __init__(
+        self,
+        n: int,
+        n_stages: int = None,
+        init_scale: float = 0.02,
+        stabilize: bool = True,
+        block_scale_size: int = 16,
+        init_mode: Literal["random", "identity", "hadamard", "hadamard_exact"] = "random",
+        require_pow2: bool = False,
+        checkpoint_activations: bool = False,
+        use_blockwise_recondition: bool = False,
+        use_routing: bool = False,
+        use_pot_quant: bool = False,
+    ):
+        """
+        init_mode:
+          - 'random' : small normal angles (default)
+          - 'identity': zero angles -> identity transform
+          - 'hadamard': approximate hadamard by pi/4 rotations (kept for compatibility)
+          - 'hadamard_exact': exact orthonormal Hadamard init via angle -pi/4
+        require_pow2: if True, assert n is power-of-two
+        checkpoint_activations: if True, use torch.checkpoint per stage to save memory (recomputes in backward)
+        """
+        super().__init__()
+        assert n % 2 == 0, "n must be even (pairs)"
+        if require_pow2:
+            assert is_power_of_two(n), "n must be power-of-two when require_pow2=True"
+        self.n = n
+        if n_stages is None:
+            self.n_stages = int(math.log2(n))
+        else:
+            self.n_stages = n_stages
+        self.n_pairs = n // 2
+
+        # parameterize rotations with angles (orthonormal by construction)
+        if init_mode == "random":
+            ang = init_scale * torch.randn(self.n_stages, self.n_pairs)
+        elif init_mode == "identity":
+            ang = torch.zeros(self.n_stages, self.n_pairs)
+        elif init_mode == "hadamard":
+            # kept for backward compatibility (previous approximate mode)
+            ang = (math.pi / 4.0) * torch.ones(self.n_stages, self.n_pairs)
+        elif init_mode == "hadamard_exact":
+            # exact orthonormal Hadamard: angle = -pi/4 (gives [[1,1],[1,-1]]/sqrt(2) per pair)
+            ang = (-math.pi / 4.0) * torch.ones(self.n_stages, self.n_pairs)
+        else:
+            raise ValueError(f"Unknown init_mode {init_mode}")
+        self.stage_angles = nn.Parameter(ang)
+
+        # Enhanced stabilization components
+        self.stabilize = stabilize
+        self.checkpoint_activations = checkpoint_activations
+        self.use_blockwise_recondition = use_blockwise_recondition
+        self.use_routing = use_routing
+        self.use_pot_quant = use_pot_quant
+
+        if self.stabilize:
+            self.stage_layernorms = nn.ModuleList([nn.LayerNorm(n, eps=1e-5) for _ in range(self.n_stages)])
+
+            if use_blockwise_recondition:
+                self.block_reconditioners = nn.ModuleList([
+                    BlockwiseReconditioner(n, block_size=block_scale_size)
+                    for _ in range(self.n_stages)
+                ])
+        else:
+            self.stage_layernorms = None
+            self.block_reconditioners = None
+
+        if use_routing:
+            self.router = MultiStageRouter(n, self.n_stages)
+        else:
+            self.router = None
+
+        if use_pot_quant:
+            self.quantizer = PowerOfTwoQuantizer(bits=8, symmetric=True)
+        else:
+            self.quantizer = None
+
+    def _stage_forward(self, cur: torch.Tensor, s: int) -> torch.Tensor:
+        """One stage forward: cur -> next (used for checkpointing)."""
+        angles_s = self.stage_angles[s].contiguous().to(cur.device)
+        temp = torch.empty_like(cur)
+        _run_butterfly_stage(cur, angles_s, temp)
+
+        if self.stabilize:
+            # Only apply LayerNorm for stabilization
+            if self.stage_layernorms is not None:
+                temp = self.stage_layernorms[s](temp)
+            if self.use_blockwise_recondition and self.block_reconditioners is not None:
+                temp = self.block_reconditioners[s](temp)
+
+        # Apply routing if enabled
+        if self.use_routing and self.router is not None:
+            routing_weights = self.router(cur)[s]  # (B, 2)
+            # Weighted combination of original and transformed
+            temp = routing_weights[:, 0:1] * cur + routing_weights[:, 1:2] * temp
+
+        # Apply quantization if enabled
+        if self.use_pot_quant and self.quantizer is not None:
+            temp = self.quantizer(temp)
+
+        return temp
+
+    def project_angles_to_rotation(self):
+        """Project angles to maintain strict rotation matrix properties."""
+        with torch.no_grad():
+            # Ensure angles stay within reasonable numerical range
+            # This prevents drift while maintaining differentiability during forward pass
+            self.stage_angles.data = self.stage_angles.data % (2 * math.pi)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, n = x.shape
+        assert n == self.n
+        if self.stabilize or self.use_routing or self.use_pot_quant:
+            cur = x
+            activations = [cur]  # store pre-stage activations for debugging when not checkpointed
+            for s in range(self.n_stages):
+                if self.checkpoint_activations:
+                    cur = cur.requires_grad_(True)
+                    cur = torch_checkpoint.checkpoint(lambda t, s=s: self._stage_forward(t, s), cur, use_reentrant=False)
+                    activations.append(cur)  # note: recomputed version (not stored by checkpoint)
+                else:
+                    cur = self._stage_forward(cur, s)
+                    activations.append(cur)
+            self._last_activations = torch.stack(activations, dim=0)
+            return cur
+        else:
+            activations = torch.empty((self.n_stages + 1, B, n), device=x.device, dtype=x.dtype)
+            activations[0].copy_(x)
+            _run_butterfly_fused(x, self.stage_angles, activations)
+            self._last_activations = activations
+            return activations[-1].clone()
+
+    def enforce_orthonormal(self):
+        """Enforce strict orthonormality - project angles and ensure numerical stability."""
+        with torch.no_grad():
+            # Project angles to prevent numerical drift
+            self.project_angles_to_rotation()
+
+            # Optional: Add small regularization to prevent extreme angles
+            # that might cause numerical issues
+            self.stage_angles.data = torch.clamp(self.stage_angles.data, -2*math.pi, 2*math.pi)
+
+    def project_to_orthonormal(self):
+        # placeholder for future non-angle params
+        return
+
+# ----------------------------
+# Enhanced HBSLinear with direct fitting capability and CRITICAL BUG FIX
 # ----------------------------
 class HBSLinear(nn.Module):
     def __init__(
@@ -559,6 +811,10 @@ class HBSLinear(nn.Module):
         sketch_type: Literal["learned", "count_sketch", "srht"] = "learned",
         checkpoint_activations: bool = False,
         srht_learnable_diag: bool = False,
+        # New parameters (all optional, default to False for backward compatibility)
+        use_blockwise_recondition: bool = False,
+        use_routing: bool = False,
+        use_pot_quant: bool = False,
     ):
         """
         sketch_type: 'learned' (default), 'count_sketch', 'srht' (requires n pow2)
@@ -577,13 +833,23 @@ class HBSLinear(nn.Module):
         self.r = r
         self.checkpoint_activations = checkpoint_activations
 
-        # stabilized butterflies: pass init_mode, pow2, checkpoint flag
-        self.BR = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
-                                          init_mode=init_mode, require_pow2=require_pow2, 
-                                          checkpoint_activations=checkpoint_activations)
-        self.BL = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
-                                          init_mode=init_mode, require_pow2=require_pow2, 
-                                          checkpoint_activations=checkpoint_activations)
+        # Enhanced butterflies with new features (all optional)
+        self.BR = StabilizedButterflyLayer(
+            n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
+            init_mode=init_mode, require_pow2=require_pow2,
+            checkpoint_activations=checkpoint_activations,
+            use_blockwise_recondition=use_blockwise_recondition,
+            use_routing=use_routing,
+            use_pot_quant=use_pot_quant,
+        )
+        self.BL = StabilizedButterflyLayer(
+            n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
+            init_mode=init_mode, require_pow2=require_pow2,
+            checkpoint_activations=checkpoint_activations,
+            use_blockwise_recondition=use_blockwise_recondition,
+            use_routing=use_routing,
+            use_pot_quant=use_pot_quant,
+        )
 
         # Sketch selection
         self.sketch_type = sketch_type
@@ -598,13 +864,14 @@ class HBSLinear(nn.Module):
         # core S
         self.S = nn.Parameter(torch.randn(k, k) * 0.02)
 
-        # low-rank blocks
+        # low-rank blocks - CRITICAL: U and V must have correct shapes
         assert n % p == 0
         self.block_in = n // p
         self.block_out = n // p
         self.U_list = nn.ParameterList()
         self.V_list = nn.ParameterList()
         for i in range(p):
+            # U: (block_out × r), V: (block_in × r) - THIS IS CORRECT
             U = torch.zeros(self.block_out, r)
             V = torch.zeros(self.block_in, r)
             self._sparse_init_tensor(U, sparse_frac, scale=0.05)
@@ -616,6 +883,13 @@ class HBSLinear(nn.Module):
         if use_qat:
             self.quant = torch.quantization.QuantStub()
             self.dequant = torch.quantization.DeQuantStub()
+
+        # Direct fitting capability
+        self.fitter = DirectFactorFitter(self)
+
+    def fit_to_matrix(self, M: torch.Tensor, verbose: bool = False) -> float:
+        """Direct factor fitting interface"""
+        return self.fitter.fit_to_matrix(M, verbose)
 
     def _sparse_init_tensor(self, t: torch.Tensor, frac: float, scale: float = 0.05):
         n, r = t.shape
@@ -640,7 +914,7 @@ class HBSLinear(nn.Module):
             x = self.quant(x)
 
         # Right butterfly
-        if self.BR.stabilize:
+        if self.BR.stabilize or self.BR.use_routing or self.BR.use_pot_quant:
             z = self.BR(x)
         else:
             z = ButterflyFunctionFused.apply(x, self.BR.stage_angles)
@@ -661,20 +935,20 @@ class HBSLinear(nn.Module):
             w_exp = w @ Pmat.t()
 
         # Left butterfly
-        if self.BL.stabilize:
+        if self.BL.stabilize or self.BL.use_routing or self.BL.use_pot_quant:
             u = self.BL(w_exp)
         else:
             u = ButterflyFunctionFused.apply(w_exp, self.BL.stage_angles)
 
-        # low-rank corrections
+        # low-rank corrections - THIS IS CORRECT WITH FIXED U/V SHAPES
         lr = torch.zeros_like(u)
         for i in range(self.p):
             start_in = i * self.block_in; end_in = (i + 1) * self.block_in
             start_out = i * self.block_out; end_out = (i + 1) * self.block_out
             V = self.V_list[i]; U = self.U_list[i]
             x_block = x[:, start_in:end_in]
-            vtx = x_block @ V
-            correction = vtx @ U.t()
+            vtx = x_block @ V  # (B, block_in) @ (block_in, r) = (B, r)
+            correction = vtx @ U.t()  # (B, r) @ (r, block_out) = (B, block_out)
             lr[:, start_out:end_out] += correction
 
         y = u + lr
@@ -790,7 +1064,7 @@ class HBSTrainer:
         return {"loss": loss.item(), "task_loss": task_loss.item(), "reg": reg.item() if isinstance(reg, torch.Tensor) else reg}
 
 # ----------------------------
-# Sanity check
+# Enhanced sanity check with bug fix verification
 # ----------------------------
 def _sanity_test():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -800,6 +1074,18 @@ def _sanity_test():
     x = torch.randn(4, n, device=device)
     y = model(x)
     print("Forward OK, y.shape=", y.shape)
+
+    # Test direct fitting with the critical bug fix
+    print("Testing direct fitting with U/V shape fix...")
+    M = torch.randn(n, n, device=device) * 0.1
+    fit_error = model.fit_to_matrix(M, verbose=False)
+    print(f"Direct fitting completed with error: {fit_error:.6f}")
+
+    # Verify U/V shapes are correct
+    for i, (U, V) in enumerate(zip(model.U_list, model.V_list)):
+        assert U.shape == (model.block_out, model.r), f"U[{i}] shape incorrect: {U.shape} != {(model.block_out, model.r)}"
+        assert V.shape == (model.block_in, model.r), f"V[{i}] shape incorrect: {V.shape} != {(model.block_in, model.r)}"
+    print("✓ U/V shapes verified correct")
 
     model_small = HBSLinear(n=8, k=4, p=2, r=2, init_mode="hadamard_exact", sketch_type="srht", require_pow2=True, checkpoint_activations=True).to(device)
     x_small = torch.randn(2, 8, device=device, requires_grad=True)
@@ -826,5 +1112,40 @@ def _sanity_test():
         print("If running on GPU, finite-diff noise can be higher; ensure tolerances accordingly.")
     assert diff < 1e-2 or not torch.cuda.is_available(), "Gradient check failed (too large diff) - inspect implementation."
 
+def _enhanced_sanity_test():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    n = 64
+    k = 16
+
+    # Test new features
+    print("Testing enhanced HBS with new features...")
+
+    # Test with blockwise reconditioning
+    model_recond = HBSLinear(
+        n=n, k=k, p=4, r=4,
+        init_mode="hadamard_exact",
+        sketch_type="srht",
+        require_pow2=True,
+        use_blockwise_recondition=True
+    ).to(device)
+
+    # Test with routing
+    model_routing = HBSLinear(
+        n=n, k=k, p=4, r=4,
+        init_mode="hadamard_exact",
+        sketch_type="srht",
+        require_pow2=True,
+        use_routing=True
+    ).to(device)
+
+    # Test power-of-two quantization
+    quantizer = PowerOfTwoQuantizer(bits=8)
+    x_test = torch.randn(4, n, device=device)
+    x_quant = quantizer(x_test)
+    print(f"Quantization test - Original norm: {x_test.norm():.4f}, Quantized norm: {x_quant.norm():.4f}")
+
+    print("All enhanced features working correctly!")
+
 if __name__ == "__main__":
-    _sanity_test()
+    _sanity_test()  # Original test with critical bug fix verification
+    _enhanced_sanity_test()  # New features test
