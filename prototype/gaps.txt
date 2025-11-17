@@ -1,0 +1,8 @@
+Minor Gaps Noted:
+❓ Power-of-Two Constraints: Implementation assumes n is even but doesn't enforce power-of-two sizes that some butterfly algorithms prefer
+
+❓ Advanced Sketching: Could add TensorSketch or other advanced sketching methods beyond simple linear projection
+
+❓ Pattern Learning: Butterfly patterns are learned but initial patterns aren't explicitly discussed
+
+❓ Memory Optimization: No explicit memory-efficient backward pass for very large n
