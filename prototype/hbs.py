@@ -1,25 +1,158 @@
 # untitled0.py
-# HBS implementation with full stabilization stack:
-# - stabilized per-stage butterfly with LayerNorm + blockwise reconditioning + orthonormal enforcement
-# - optional high-performance fused kernel (kept but NOT the default in stabilized mode)
-# - P / S core and low-rank corrections
+# HBS implementation with optional power-of-two enforcement, advanced sketch types,
+# butterfly initialization modes, checkpointed memory-efficient backward,
+# Triton-based WHT for SRHT, and exact Hadamard orthogonal initialization.
 #
 # Requirements: torch, triton
 
 import math
 import random
-from typing import List
+from typing import List, Literal, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils import checkpoint as torch_checkpoint
 
 import triton
 import triton.language as tl
 
 # ----------------------------
-# Per-stage Triton kernel: applies Givens rotations for one stage.
-# This kernel is used when the StabilizedButterflyLayer runs in stabilized (per-stage) mode.
+# Utilities
+# ----------------------------
+def is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+def fwht(x: torch.Tensor) -> torch.Tensor:
+    """
+    Pure-PyTorch FWHT (CPU or GPU) — used as fallback when Triton not available/called.
+    Works with power-of-two length on last dim.
+    """
+    n = x.shape[-1]
+    assert is_power_of_two(n), "FWHT requires power-of-two length"
+    out = x
+    h = 1
+    while h < n:
+        out = out.view(*out.shape[:-1], -1, 2 * h)
+        a = out[..., :h]
+        b = out[..., h:2 * h]
+        out = torch.cat([a + b, a - b], dim=-1)
+        out = out.view(*x.shape)
+        h *= 2
+    return out
+
+# ----------------------------
+# Triton WHT kernel (per-batch fused WHT)
+# This kernel computes the (unnormalized) Hadamard transform:
+# after all stages, optionally divides by sqrt(n) to produce orthonormal H.
+# ----------------------------
+@triton.jit
+def _triton_wht_kernel_per_batch(
+    x_ptr,            # pointer to input (B, n)
+    out_ptr,          # pointer to output (B, n) - can alias input
+    n_pairs,          # n//2
+    n_stages,
+    n,
+    stride_batch_x,
+    stride_n_x,
+    stride_batch_out,
+    stride_n_out,
+    PAIRS_PER_BLOCK: tl.constexpr = 128,
+):
+    bid = tl.program_id(0)  # batch id
+    # We will perform each stage sequentially inside the kernel.
+    # For each stage s, dist = 1 << s, mapping similar to butterfly: pair index -> (i0,i1)
+    # We'll allocate two buffers in registers by alternating usage via base offsets in global memory.
+    # To simplify, we operate directly writing to out_ptr stage-by-stage (reads from either x_ptr or out_ptr).
+    # We'll use two global buffers by toggling a flag: src_base and dst_base offsets (0 or n*B).
+    # For simplicity, use in-place via double-buffering with offsets:
+    total_elems = (n_stages + 1) * 0  # unused, kept for readability
+
+    # We'll allocate src_offset as 0 for first stage (read from x_ptr), then read/write to out_ptr (same pointer).
+    # To avoid complicated double-buffer addressing in Triton, we'll perform per-stage updates
+    # reading from base "cur_ptr" and writing to "tmp_ptr" where tmp_ptr is out_ptr for stage result,
+    # then copy tmp_ptr into cur_ptr for next stage by issuing another stage loop that reads tmp and writes cur, etc.
+    # To keep kernel compact, we will perform the transform in-place using the same layout: read values and write back.
+
+    # We'll use a simple approach: for each stage s, process pairs in blocks and perform pairwise sum/diff writing to out_ptr.
+    for s in range(n_stages):
+        dist = 1 << s
+        pair_base = 0
+        while pair_base < n_pairs:
+            offs = pair_base + tl.arange(0, PAIRS_PER_BLOCK)
+            mask_pair = offs < n_pairs
+
+            group = offs // dist
+            j = offs - group * dist
+            i0 = group * (2 * dist) + j
+            i1 = i0 + dist
+
+            off0 = bid * stride_batch_x + i0 * stride_n_x
+            off1 = bid * stride_batch_x + i1 * stride_n_x
+
+            a = tl.load(x_ptr + off0, mask=mask_pair, other=0.0)
+            b = tl.load(x_ptr + off1, mask=mask_pair, other=0.0)
+
+            y0 = a + b
+            y1 = a - b
+
+            out_off0 = bid * stride_batch_out + i0 * stride_n_out
+            out_off1 = bid * stride_batch_out + i1 * stride_n_out
+            tl.store(out_ptr + out_off0, y0, mask=mask_pair)
+            tl.store(out_ptr + out_off1, y1, mask=mask_pair)
+
+            pair_base += PAIRS_PER_BLOCK
+
+        # After writing stage results to out_ptr, swap pointers by copying stage result back to x_ptr region.
+        # We'll perform a second loop to copy out_ptr -> x_ptr so the next stage reads updated data.
+        # FIX 2: Correct copy-back - copy every element, not by pair indexing
+        elem_base = 0
+        while elem_base < n:
+            offs = elem_base + tl.arange(0, PAIRS_PER_BLOCK * 2)
+            mask = offs < n
+
+            off_src = bid * stride_batch_out + offs * stride_n_out
+            val = tl.load(out_ptr + off_src, mask=mask, other=0.0)
+
+            off_dst = bid * stride_batch_x + offs * stride_n_x
+            tl.store(x_ptr + off_dst, val, mask=mask)
+
+            elem_base += PAIRS_PER_BLOCK * 2
+
+    # After all stages x_ptr now contains full WHT result in-place. Optionally normalization will be done by caller.
+
+def _triton_wht(x: torch.Tensor, normalize: bool = True):
+    """
+    Compute Walsh-Hadamard Transform on x (B, n) in-place using Triton kernel.
+    Requires n power-of-two.
+    Returns new tensor (same device).
+    """
+    assert x.is_cuda, "Triton WHT requires CUDA tensor"
+    B, n = x.shape
+    assert is_power_of_two(n), "WHT requires power-of-two length"
+    n_pairs = n // 2
+    n_stages = int(math.log2(n))
+    # allocate output buffer (we use out buffer separate to avoid alias hazards)
+    out = torch.empty_like(x)
+    stride_batch_x = x.stride(0)
+    stride_n_x = x.stride(1)
+    stride_batch_out = out.stride(0)
+    stride_n_out = out.stride(1)
+    # launch grid: (B,)
+    grid = (B,)
+    _triton_wht_kernel_per_batch[grid](
+        x, out,
+        n_pairs, n_stages, n,
+        stride_batch_x, stride_n_x,
+        stride_batch_out, stride_n_out,
+        PAIRS_PER_BLOCK=128
+    )
+    if normalize:
+        out = out * (1.0 / math.sqrt(n))
+    return out
+
+# ----------------------------
+# Triton per-stage kernel (existing)
 # ----------------------------
 @triton.jit
 def _butterfly_stage_kernel(
@@ -86,10 +219,8 @@ def _run_butterfly_stage(x: torch.Tensor, angles: torch.Tensor, out: torch.Tenso
         PAIRS_PER_BLOCK=pairs_per_block
     )
 
-
 # ----------------------------
-# Optional fused kernel (kept for high-performance non-stabilized mode)
-# (Same fused kernel as before; not used by default in stabilized mode.)
+# Fused kernel (kept)
 # ----------------------------
 @triton.autotune(
     configs=[
@@ -180,24 +311,34 @@ def _run_butterfly_fused(x: torch.Tensor, stage_angles: torch.Tensor, activation
         stride_stage, stride_batch_act
     )
 
-
 # ----------------------------
-# StabilizedButterflyLayer
-# - by default runs in stabilized per-stage mode (stabilize=True)
-# - provides layernorms and blockwise reconditioning (learnable scales)
-# - orthonormal enforcement utility included
+# StabilizedButterflyLayer with init modes and checkpointing
 # ----------------------------
 class StabilizedButterflyLayer(nn.Module):
-    def __init__(self, n: int, n_stages: int = None, init_scale: float = 0.02, stabilize: bool = True, block_scale_size: int = 16):
+    def __init__(
+        self,
+        n: int,
+        n_stages: int = None,
+        init_scale: float = 0.02,
+        stabilize: bool = True,
+        block_scale_size: int = 16,
+        init_mode: Literal["random", "identity", "hadamard", "hadamard_exact"] = "random",
+        require_pow2: bool = False,
+        checkpoint_activations: bool = False,
+    ):
         """
-        n: input dim (must be even)
-        n_stages: number of butterfly stages; default log2(n)
-        stabilize: if True, run per-stage Triton kernel with LayerNorm and blockwise reconditioning
-                   if False, you can use fused kernel (higher perf but less stabilization)
-        block_scale_size: granularity of blockwise scaling applied after each stage
+        init_mode:
+          - 'random' : small normal angles (default)
+          - 'identity': zero angles -> identity transform
+          - 'hadamard': approximate hadamard by pi/4 rotations (kept for compatibility)
+          - 'hadamard_exact': exact orthonormal Hadamard init via angle -pi/4
+        require_pow2: if True, assert n is power-of-two
+        checkpoint_activations: if True, use torch.checkpoint per stage to save memory (recomputes in backward)
         """
         super().__init__()
         assert n % 2 == 0, "n must be even (pairs)"
+        if require_pow2:
+            assert is_power_of_two(n), "n must be power-of-two when require_pow2=True"
         self.n = n
         if n_stages is None:
             self.n_stages = int(math.log2(n))
@@ -206,106 +347,88 @@ class StabilizedButterflyLayer(nn.Module):
         self.n_pairs = n // 2
 
         # parameterize rotations with angles (orthonormal by construction)
-        self.stage_angles = nn.Parameter(init_scale * torch.randn(self.n_stages, self.n_pairs))
+        if init_mode == "random":
+            ang = init_scale * torch.randn(self.n_stages, self.n_pairs)
+        elif init_mode == "identity":
+            ang = torch.zeros(self.n_stages, self.n_pairs)
+        elif init_mode == "hadamard":
+            # kept for backward compatibility (previous approximate mode)
+            ang = (math.pi / 4.0) * torch.ones(self.n_stages, self.n_pairs)
+        elif init_mode == "hadamard_exact":
+            # exact orthonormal Hadamard: angle = -pi/4 (gives [[1,1],[1,-1]]/sqrt(2) per pair)
+            ang = (-math.pi / 4.0) * torch.ones(self.n_stages, self.n_pairs)
+        else:
+            raise ValueError(f"Unknown init_mode {init_mode}")
+        self.stage_angles = nn.Parameter(ang)
 
         # Stabilization components
         self.stabilize = stabilize
+        self.checkpoint_activations = checkpoint_activations
         # per-stage LayerNorm (applied to the full vector after each stage)
         self.stage_layernorms = nn.ModuleList([nn.LayerNorm(n, eps=1e-5) for _ in range(self.n_stages)])
         # blockwise reconditioning scales (learnable multiplicative factors per small block)
-        # we'll tile vector into blocks of size block_scale_size
         self.block_scale_size = block_scale_size
         n_blocks = max(1, n // block_scale_size)
         self.stage_block_scales = nn.ParameterList([
             nn.Parameter(torch.ones(n_blocks) * 1.0) for _ in range(self.n_stages)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (B, n)
-        Returns y: (B, n)
-        If stabilize=True: run per-stage kernels with LayerNorm+blockscales between stages.
-        Else: run fused kernel (faster) and **do not** apply per-stage LayerNorm or blockscales.
-        """
-        B, n = x.shape
-        assert n == self.n, f"Input n={n} mismatches layer n={self.n}"
+    def _stage_forward(self, cur: torch.Tensor, s: int) -> torch.Tensor:
+        """One stage forward: cur -> next (used for checkpointing)."""
+        angles_s = self.stage_angles[s].contiguous().to(cur.device)
+        temp = torch.empty_like(cur)
+        _run_butterfly_stage(cur, angles_s, temp)
+        normed = self.stage_layernorms[s](temp)
+        scales = self.stage_block_scales[s]
+        expanded = scales.repeat_interleave(self.block_scale_size)
+        expanded = expanded.to(normed.device)
+        if expanded.numel() < self.n:
+            pad = self.n - expanded.numel()
+            expanded = torch.cat([expanded, torch.ones(pad, device=expanded.device)])
+        elif expanded.numel() > self.n:
+            expanded = expanded[:self.n]
+        scaled = normed * expanded.unsqueeze(0)
+        return scaled
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, n = x.shape
+        assert n == self.n
         if self.stabilize:
-            # we'll perform staged execution: for each stage, call per-stage kernel then LayerNorm and block scaling.
             cur = x
-            temp = torch.empty_like(cur)
-            activations = [cur]  # store pre-stage activations for backward
+            activations = [cur]  # store pre-stage activations for debugging when not checkpointed
             for s in range(self.n_stages):
-                angles_s = self.stage_angles[s].contiguous().to(cur.device)
-                # run per-stage triton kernel: cur -> temp
-                _run_butterfly_stage(cur, angles_s, temp)
-                # apply layernorm
-                normed = self.stage_layernorms[s](temp)
-                # apply blockwise scaling
-                scales = self.stage_block_scales[s]  # (n_blocks,)
-                # expand scales to full vector (tile)
-                expanded = scales.repeat_interleave(self.block_scale_size)
-                expanded = expanded.to(normed.device)
-                # if sizes mismatch at tail, pad/truncate
-                if expanded.numel() < n:
-                    pad = n - expanded.numel()
-                    expanded = torch.cat([expanded, torch.ones(pad, device=expanded.device)])
-                elif expanded.numel() > n:
-                    expanded = expanded[:n]
-                scaled = normed * expanded.unsqueeze(0)
-                # set up for next stage
-                cur = scaled
-                activations.append(cur)
-                # reuse temp for next stage
-                temp = torch.empty_like(cur)
-            # final output is cur
-            # Store activations for backward on the module object for use by custom autograd
-            # (We will use a custom autograd.Function wrapper at HBS level that expects activations saved).
-            # Here we simply return cur. The ButterflyFunction wrapper will not be used in stabilize mode.
-            # Instead we provide a fallback simple PyTorch autograd path (rotations are expressed via builtin ops).
-            # But for efficiency we kept per-stage Triton kernels above.
-            # Stack activations for possible external checks / debugging (not used directly here).
-            self._last_activations = torch.stack(activations, dim=0)  # (n_stages+1, B, n)
+                if self.checkpoint_activations:
+                    cur = cur.requires_grad_(True)
+                    cur = torch_checkpoint.checkpoint(lambda t, s=s: self._stage_forward(t, s), cur, use_reentrant=False)
+                    activations.append(cur)  # note: recomputed version (not stored by checkpoint)
+                else:
+                    cur = self._stage_forward(cur, s)
+                    activations.append(cur)
+            self._last_activations = torch.stack(activations, dim=0)
             return cur
         else:
-            # fast fused path
-            # allocate activations buffer and run fused kernel
             activations = torch.empty((self.n_stages + 1, B, n), device=x.device, dtype=x.dtype)
             activations[0].copy_(x)
             _run_butterfly_fused(x, self.stage_angles, activations)
-            # no LN or blockscales applied in fused mode
             self._last_activations = activations
             return activations[-1].clone()
 
     def enforce_orthonormal(self):
-        """
-        Enforce orthonormality / stability constraints on parameters.
-        For angle parameterization, rotations are already orthonormal; for block scales we clamp to positive range.
-        """
-        # clamp block scales to a reasonable range to avoid collapse/explosion
+        """Clamp block scales; angles are orthonormal by construction."""
         with torch.no_grad():
-            for i, s in enumerate(self.stage_block_scales):
+            for s in self.stage_block_scales:
                 s.clamp_(0.1, 10.0)
 
     def project_to_orthonormal(self):
-        """
-        General projection: if someone replaces angle parameterization with explicit 2x2 matrices,
-        this helper projects those matrices to nearest orthonormal via polar decomposition.
-        Keeps API compatibility for future param types.
-        """
-        # nothing to project when using angle param
+        # placeholder for future non-angle params
         return
 
-
 # ----------------------------
-# Simple stabilized ButterflyFunction wrapper for autograd compatibility
-# When StabilizedButterflyLayer.stabilize is True we rely on PyTorch autograd (per-stage operations are PyTorch/Triton)
-# When False we use fused ButterflyFunction (previous fused autograd function).
+# Fused function wrapper (unchanged)
 # ----------------------------
 class ButterflyFunctionFused(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, stage_angles):
-        # fused: use previously implemented fused function
         B, n = x.shape
         activations = torch.empty((stage_angles.shape[0] + 1, B, n), device=x.device, dtype=x.dtype)
         activations[0].copy_(x)
@@ -340,9 +463,79 @@ class ButterflyFunctionFused(torch.autograd.Function):
         grad_x = g
         return grad_x, grad_angles
 
+# ----------------------------
+# Sketching helpers: learned, count_sketch, srht (SRHT uses Triton WHT when on CUDA)
+# ----------------------------
+class Sketch:
+    def __init__(self, n: int, k: int, sketch_type: str = "learned", device=None, dtype=torch.float32, srht_learnable_diag: bool = False):
+        self.n = n
+        self.k = k
+        self.type = sketch_type
+        self.device = device
+        self.dtype = dtype
+        self.srht_learnable_diag = srht_learnable_diag
+        if sketch_type == "learned":
+            # P is a learnable parameter; caller will register it
+            self.P = None
+        elif sketch_type == "count_sketch":
+            rng = torch.Generator()
+            idx = torch.randint(0, k, (n,), generator=rng)
+            signs = torch.randint(0, 2, (n,), generator=rng).float() * 2.0 - 1.0
+            self.idx = idx.to(device)
+            self.signs = signs.to(device).to(dtype)
+        elif sketch_type == "srht":
+            assert is_power_of_two(n), "SRHT requires n to be power-of-two"
+            rng = torch.Generator()
+            # D: random rademacher diag (±1); optionally learnable via small gate
+            self.randsign = (torch.randint(0, 2, (n,), generator=rng).float() * 2.0 - 1.0).to(device).to(dtype)
+            # random sample indices to choose k columns
+            self.sample_idx = torch.randperm(n, generator=rng)[:k].to(device)
+            # optionally allow D to be learnable via small multiplier param (not enabled by default)
+            if srht_learnable_diag:
+                self.D_param = nn.Parameter(self.randsign.clone())
+            else:
+                self.D_param = None
+        else:
+            raise ValueError("Unknown sketch_type")
+
+    def apply(self, x: torch.Tensor, P_param: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: (B, n)
+        P_param: if learned, pass the parameter (n, k)
+        returns (B, k)
+        """
+        if self.type == "learned":
+            assert P_param is not None
+            return x @ P_param
+        elif self.type == "count_sketch":
+            sx = x * self.signs.unsqueeze(0)
+            out = x.new_zeros((x.shape[0], self.k))
+            out.index_add_(1, self.idx, sx)
+            return out
+        elif self.type == "srht":
+            # FIX 1: Ensure D and sample_idx are on same device/dtype as x
+            if self.D_param is not None:
+                D = self.D_param.to(x.device, x.dtype)
+            else:
+                D = self.randsign.to(x.device, x.dtype)
+
+            sample_idx = self.sample_idx.to(x.device)
+
+            Dx = x * D.unsqueeze(0)
+
+            if x.is_cuda:
+                Hx = _triton_wht(Dx, normalize=False)
+            else:
+                Hx = fwht(Dx)
+
+            # Subsample columns
+            out = Hx[:, sample_idx] * (1.0 / math.sqrt(self.k))
+            return out
+        else:
+            raise RuntimeError("invalid sketch type")
 
 # ----------------------------
-# HBSLinear (unchanged semantics but default to stabilized butterflies)
+# HBSLinear (integrates sketch selection, pow2 option, init_mode)
 # ----------------------------
 class HBSLinear(nn.Module):
     def __init__(
@@ -356,20 +549,48 @@ class HBSLinear(nn.Module):
         use_qat: bool = False,
         stabilize_butterfly: bool = True,
         block_scale_size: int = 16,
+        init_mode: Literal["random", "identity", "hadamard", "hadamard_exact"] = "random",
+        require_pow2: bool = False,
+        sketch_type: Literal["learned", "count_sketch", "srht"] = "learned",
+        checkpoint_activations: bool = False,
+        srht_learnable_diag: bool = False,
     ):
+        """
+        sketch_type: 'learned' (default), 'count_sketch', 'srht' (requires n pow2)
+        init_mode: initialization for butterfly angles (including 'hadamard_exact')
+        require_pow2: optionally enforce power-of-two sizes (used for SRHT / hadamard_exact)
+        checkpoint_activations: if True, per-stage forward uses checkpointing to save memory
+        srht_learnable_diag: if True, allow learning the SRHT diagonal signs as real multipliers (advanced)
+        """
         super().__init__()
         assert n % 2 == 0
+        if require_pow2:
+            assert is_power_of_two(n), "When require_pow2=True, n must be power-of-two"
         self.n = n
         self.k = k
         self.p = p
         self.r = r
+        self.checkpoint_activations = checkpoint_activations
 
-        # stabilized butterflies by default
-        self.BR = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly, block_scale_size=block_scale_size)
-        self.BL = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly, block_scale_size=block_scale_size)
+        # stabilized butterflies: pass init_mode, pow2, checkpoint flag
+        self.BR = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
+                                          block_scale_size=block_scale_size, init_mode=init_mode,
+                                          require_pow2=require_pow2, checkpoint_activations=checkpoint_activations)
+        self.BL = StabilizedButterflyLayer(n, n_stages=butterfly_stages, stabilize=stabilize_butterfly,
+                                          block_scale_size=block_scale_size, init_mode=init_mode,
+                                          require_pow2=require_pow2, checkpoint_activations=checkpoint_activations)
 
-        # projection and core
-        self.P = nn.Parameter(torch.randn(n, k) * (1.0 / math.sqrt(n)))
+        # Sketch selection
+        self.sketch_type = sketch_type
+        self.sketcher = Sketch(n, k, sketch_type=sketch_type, device=None, srht_learnable_diag=srht_learnable_diag)
+        if sketch_type == "learned":
+            # register P as a parameter
+            self.P = nn.Parameter(torch.randn(n, k) * (1.0 / math.sqrt(n)))
+        else:
+            # P is not trainable for structured sketches; keep a placeholder None
+            self.P = None
+
+        # core S
         self.S = nn.Parameter(torch.randn(k, k) * 0.02)
 
         # low-rank blocks
@@ -399,20 +620,40 @@ class HBSLinear(nn.Module):
             j = random.randrange(0, r)
             t[i, j] = (random.random() * 2 - 1) * scale
 
+    def _project(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Project x: (B, n) -> (B, k) according to sketch_type.
+        For learned sketch, uses self.P; for others, uses sketcher.apply.
+        """
+        if self.sketch_type == "learned":
+            return x @ self.P
+        else:
+            return self.sketcher.apply(x, P_param=None)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_qat:
             x = self.quant(x)
 
         # Right butterfly
         if self.BR.stabilize:
-            z = self.BR(x)   # per-stage kernels with LayerNorm + blockscales
+            z = self.BR(x)
         else:
             z = ButterflyFunctionFused.apply(x, self.BR.stage_angles)
 
-        # projection and core
-        z_k = z @ self.P
+        # project
+        z_k = self._project(z)  # (B, k)
+
+        # core multiply
         w = z_k @ self.S
-        w_exp = w @ self.P.t()
+
+        # expansion back to n dims (P^T)
+        if self.P is not None:
+            w_exp = w @ self.P.t()
+        else:
+            # fallback for structured sketches: build dense matrix (small k) — expensive, but works
+            # FIX 3: Ensure proper device and dtype conversion
+            Pmat = self._build_dense_sketch_matrix().to(w.device, w.dtype)
+            w_exp = w @ Pmat.t()
 
         # Left butterfly
         if self.BL.stabilize:
@@ -437,13 +678,38 @@ class HBSLinear(nn.Module):
             y = self.dequant(y)
         return y
 
+    def _build_dense_sketch_matrix(self):
+        """Builds a dense (n,k) sketch matrix for non-learned sketches (used only for P^T expansion)."""
+        if self.sketch_type == "count_sketch":
+            S = torch.zeros(self.n, self.k)
+            idx = self.sketcher.idx.cpu()
+            signs = self.sketcher.signs.cpu()
+            for i in range(self.n):
+                S[i, idx[i]] = signs[i].item()
+            return S
+        elif self.sketch_type == "srht":
+            # SRHT dense matrix: D * H * (1/sqrt(k)) * sampling matrix
+            # Use CPU FWHT to assemble small dense matrix (only used when P is None and needed)
+            D = torch.diag(self.sketcher.randsign.cpu())
+            I = torch.eye(self.n)
+            H = fwht(I)  # (n,n)
+            H = H / math.sqrt(self.n)
+            sampled = H[:, self.sketcher.sample_idx.cpu()] * (1.0 / math.sqrt(self.k))
+            return (D @ sampled)
+        else:
+            raise RuntimeError("No dense sketch for learned (shouldn't call)")
+
     def hutchinson_subspace_energy(self, n_samples: int = 8, device: torch.device = None):
         device = device or next(self.parameters()).device
         total = 0.0
         for _ in range(n_samples):
             v = torch.randn(1, self.n, device=device)
             Mv = self.forward(v)
-            Pv = (Mv @ self.P) @ self.P.t()
+            if self.sketch_type == "learned":
+                Pv = (Mv @ self.P) @ self.P.t()
+            else:
+                Pmat = self._build_dense_sketch_matrix().to(device)
+                Pv = (Mv @ Pmat) @ Pmat.t()
             r = Mv - Pv
             total += (r * r).sum().item()
         return total / n_samples
@@ -462,23 +728,21 @@ class HBSLinear(nn.Module):
         subspace_penalty = 1.0 - subspace_ratio
         return 1e-3 * nuclear + 1e-3 * subspace_penalty
 
-    # helper to enforce stabilization across butterflies (call from trainer)
     def enforce_stability(self):
         self.BR.enforce_orthonormal()
         self.BL.enforce_orthonormal()
 
-
 # ----------------------------
-# HBSModel & Trainer (enforce orthonormal regularly during training)
+# HBSModel & Trainer
 # ----------------------------
 class HBSModel(nn.Module):
-    def __init__(self, hidden_dims: List[int], sketch_dim: int = 32, p: int = 2, r: int = 8, use_qat: bool = False):
+    def __init__(self, hidden_dims: List[int], sketch_dim: int = 32, p: int = 2, r: int = 8, **kwargs):
         super().__init__()
         assert len(hidden_dims) >= 2
         self.layers = nn.ModuleList()
         for in_dim, out_dim in zip(hidden_dims[:-1], hidden_dims[1:]):
-            assert in_dim == out_dim, "This example assumes square layers for simplicity."
-            self.layers.append(HBSLinear(n=in_dim, k=sketch_dim, p=p, r=r, use_qat=use_qat))
+            assert in_dim == out_dim
+            self.layers.append(HBSLinear(n=in_dim, k=sketch_dim, p=p, r=r, **kwargs))
         self.activation = nn.GELU()
 
     def forward(self, x):
@@ -493,7 +757,6 @@ class HBSModel(nn.Module):
         for l in self.layers:
             tot = tot + l.regularization_loss()
         return tot
-
 
 class HBSTrainer:
     def __init__(self, model: nn.Module, optimizer, scheduler=None, reg_weight: float = 0.1, ortho_step_every: int = 1):
@@ -515,29 +778,25 @@ class HBSTrainer:
         self.optimizer.step()
         if self.scheduler:
             self.scheduler.step()
-
-        # Enforce stability every few iterations
         if (self.iter % self.ortho_step_every) == 0:
             for l in self.model.layers:
                 l.enforce_stability()
         self.iter += 1
-
         return {"loss": loss.item(), "task_loss": task_loss.item(), "reg": reg.item() if isinstance(reg, torch.Tensor) else reg}
 
-
 # ----------------------------
-# Sanity check (numeric gradient test)
+# Sanity check
 # ----------------------------
 def _sanity_test():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     n = 64
     k = 16
-    model = HBSLinear(n=n, k=k, p=4, r=4).to(device)
+    model = HBSLinear(n=n, k=k, p=4, r=4, init_mode="hadamard_exact", sketch_type="srht", require_pow2=True, checkpoint_activations=False).to(device)
     x = torch.randn(4, n, device=device)
     y = model(x)
     print("Forward OK, y.shape=", y.shape)
 
-    model_small = HBSLinear(n=8, k=4, p=2, r=2).to(device)
+    model_small = HBSLinear(n=8, k=4, p=2, r=2, init_mode="hadamard_exact", sketch_type="srht", require_pow2=True, checkpoint_activations=True).to(device)
     x_small = torch.randn(2, 8, device=device, requires_grad=True)
     def fwd(x_):
         return model_small(x_).sum()
